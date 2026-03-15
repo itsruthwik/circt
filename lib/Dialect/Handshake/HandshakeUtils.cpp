@@ -170,6 +170,8 @@ Type circt::handshake::toValidType(Type t) {
       })
       .Case<NoneType>(
           [&](NoneType nt) { return IntegerType::get(nt.getContext(), 0); })
+      .Case<FloatType>(
+          [&](FloatType ft) { return IntegerType::get(ft.getContext(), ft.getWidth()); })
       .Default([&](Type t) { return t; });
 }
 

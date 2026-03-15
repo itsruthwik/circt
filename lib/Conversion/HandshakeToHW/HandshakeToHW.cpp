@@ -164,6 +164,8 @@ static std::string getTypeName(Location loc, Type type) {
     typeName += "_tuple";
     for (auto elementType : tupleType.getTypes())
       typeName += getTypeName(loc, elementType);
+  } else if (auto floatType = dyn_cast<FloatType>(type)) {
+    typeName += "_f" + std::to_string(floatType.getWidth());
   } else if (auto structType = dyn_cast<hw::StructType>(type)) {
     typeName += "_struct";
     for (auto element : structType.getElements())
@@ -700,6 +702,15 @@ static Value createZeroDataConst(RTLBuilder &s, Location loc, Type type) {
       .Case<IntType, IntegerType>([&](auto type) {
         return s.constant(type.getIntOrFloatBitWidth(), 0);
       })
+      .Case<FloatType>([&](FloatType fType) -> Value {
+        // IEEE 754: +0.0 is all-zero bits.  Create an integer zero of the
+        // same width and cast to the float type so that the register reset
+        // value has the correct type.
+        unsigned w = fType.getWidth();
+        Value intZero = s.constant(w, 0);
+        return UnrealizedConversionCastOp::create(s.b, loc, fType, intZero)
+            .getResult(0);
+      })
       .Case<hw::StructType>([&](auto structType) {
         SmallVector<Value> zeroValues;
         for (auto field : structType.getElements())
@@ -1150,7 +1161,7 @@ public:
   void buildModule(hw::StructCreateOp op, BackedgeBuilder &bb, RTLBuilder &s,
                    hw::HWModulePortAccessor &ports) const override {
     auto unwrappedIO = unwrapIO(s, bb, ports);
-    auto structType = op.getResult().getType();
+    auto structType = cast<hw::StructType>(toValidType(op.getResult().getType()));
     buildUnitRateJoinLogic(s, unwrappedIO, [&](ValueRange inputs) {
       return s.pack(inputs, structType);
     });
@@ -1543,7 +1554,8 @@ public:
     auto hlmem = seq::HLMemOp::create(
         s.b, loc, s.clk, s.rst,
         "_handshake_memory_" + std::to_string(op.getId()),
-        op.getMemRefType().getShape(), op.getMemRefType().getElementType());
+        op.getMemRefType().getShape(),
+        toValidType(op.getMemRefType().getElementType()));
 
     // Create load ports...
     for (auto &ld : loadPorts) {
@@ -1635,7 +1647,15 @@ public:
     auto unwrappedIO = this->unwrapIO(s, bb, ports);
     unwrappedIO.outputs[0].valid->setValue(unwrappedIO.inputs[0].valid);
     unwrappedIO.inputs[0].ready->setValue(unwrappedIO.outputs[0].ready);
-    auto constantValue = op->getAttrOfType<IntegerAttr>("value").getValue();
+    APInt constantValue;
+    if (auto intAttr = op->getAttrOfType<IntegerAttr>("value")) {
+      constantValue = intAttr.getValue();
+    } else if (auto floatAttr = op->getAttrOfType<FloatAttr>("value")) {
+      constantValue = floatAttr.getValue().bitcastToAPInt();
+    } else {
+      op->emitError("unsupported constant type");
+      return;
+    }
     unwrappedIO.outputs[0].data->setValue(s.constant(constantValue));
   };
 };
