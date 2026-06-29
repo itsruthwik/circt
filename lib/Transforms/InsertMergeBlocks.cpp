@@ -245,6 +245,12 @@ static LogicalResult preconditionCheck(Region &r, CFGLoopInfo &loopInfo) {
 /// transformation.
 LogicalResult circt::insertMergeBlocks(Region &r,
                                        ConversionPatternRewriter &rewriter) {
+  // A single-block (or empty) region has no branches and therefore no merge
+  // blocks to insert. It is also degenerate for the analyses below:
+  // getDomTree() asserts on single-block regions. No-op in that case.
+  if (r.empty() || r.hasOneBlock())
+    return success();
+
   Block *entry = &r.front();
   DominanceInfo domInfo(r.getParentOp());
 
