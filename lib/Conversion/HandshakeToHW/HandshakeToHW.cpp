@@ -970,16 +970,24 @@ public:
 
   Value buildPriorityArbiter(RTLBuilder &s, ArrayRef<Value> inputs,
                              Value defaultValue,
-                             DenseMap<size_t, Value> &indexMapping) const {
+                             DenseMap<size_t, Value> &indexMapping,
+                             bool preferHighIndex = false) const {
     auto numInputs = inputs.size();
     auto priorityArb = defaultValue;
 
-    for (size_t i = numInputs; i > 0; --i) {
-      size_t inputIndex = i - 1;
+    auto visit = [&](size_t inputIndex) {
       size_t oneHotIndex = size_t{1} << inputIndex;
       auto constIndex = s.constant(numInputs, oneHotIndex);
       indexMapping[inputIndex] = constIndex;
       priorityArb = s.mux(inputs[inputIndex], {priorityArb, constIndex});
+    };
+
+    if (preferHighIndex) {
+      for (size_t inputIndex = 0; inputIndex < numInputs; ++inputIndex)
+        visit(inputIndex);
+    } else {
+      for (size_t i = numInputs; i > 0; --i)
+        visit(i - 1);
     }
     return priorityArb;
   }
@@ -1325,7 +1333,8 @@ public:
     // ready outputs.
     DenseMap<size_t, Value> argIndexValues;
     Value priorityArb = buildPriorityArbiter(s, unwrappedIO.getInputValids(),
-                                             noWinner, argIndexValues);
+                                             noWinner, argIndexValues,
+                                             /*preferHighIndex=*/true);
     priorityArb = s.mux(hadWinnerCondition, {priorityArb, wonReg});
     win.setValue(priorityArb);
 
