@@ -245,6 +245,14 @@ static LogicalResult preconditionCheck(Region &r, CFGLoopInfo &loopInfo) {
 /// transformation.
 LogicalResult circt::insertMergeBlocks(Region &r,
                                        ConversionPatternRewriter &rewriter) {
+  // A region with no blocks (external) or a single block has no control-flow
+  // divergence, so there are no merge blocks to insert. Return early: the
+  // dominance API asserts when asked for the DomTree of a single-block region
+  // ("Can't get DomTree for single block regions"), which would otherwise abort
+  // on straight-line functions.
+  if (r.empty() || r.hasOneBlock())
+    return success();
+
   Block *entry = &r.front();
   DominanceInfo domInfo(r.getParentOp());
 
