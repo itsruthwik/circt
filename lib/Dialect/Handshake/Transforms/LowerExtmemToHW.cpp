@@ -414,6 +414,16 @@ HandshakeLowerExtmemToHWPass::lowerExtmemToHW(handshake::FuncOp func) {
     unsigned i = it.first;
     auto arg = it.second;
     auto loc = arg.getLoc();
+    // Insert/erase positions must use the argument's LIVE index, not its
+    // original index `i`. Converting a previous memref argument mutates the
+    // argument list (an inout arg inserts a load AND a store port, then erases
+    // the memref -> a net +1), so a later memref arg's original index is stale.
+    // Using the stale index would insert this arg's ports at the wrong place and
+    // erase a still-used port argument instead of the memref -> a
+    // "Cannot destroy a value that still has uses" assertion. arg.getArgNumber()
+    // reflects the current position after all prior conversions. (`i` is retained
+    // only as the original-index key for argReplacements / the ESI wrapper.)
+    unsigned base = cast<BlockArgument>(arg).getArgNumber();
     // Get the attached extmemory external module.
     auto extmemOp = cast<handshake::ExternalMemoryOp>(*arg.getUsers().begin());
     b.setInsertionPoint(extmemOp);
@@ -426,11 +436,11 @@ HandshakeLowerExtmemToHWPass::lowerExtmemToHW(handshake::FuncOp func) {
         cast<handshake::ReturnOp>(func.getBody().front().getTerminator());
     llvm::SmallVector<Value> newReturnOperands = oldReturnOp.getOperands();
     unsigned addedInPorts = 0;
-    auto memName = func.getArgName(i);
+    auto memName = func.getArgName(base);
     auto addArgRes = [&](unsigned id, NamedType &argType,
                          NamedType &resType) -> FailureOr<Value> {
       // Function argument
-      unsigned newArgIdx = i + addedInPorts;
+      unsigned newArgIdx = base + addedInPorts;
       if (failed(
               func.insertArgument(newArgIdx, argType.second, {}, arg.getLoc())))
         return failure();
@@ -485,9 +495,9 @@ HandshakeLowerExtmemToHWPass::lowerExtmemToHW(handshake::FuncOp func) {
 
     // Erase the original memref argument of the top-level i/o now that it's
     // use has been removed.
-    if (failed(func.eraseArgument(i + addedInPorts)))
+    if (failed(func.eraseArgument(base + addedInPorts)))
       return failure();
-    eraseFromArrayAttr(func, "argNames", i + addedInPorts);
+    eraseFromArrayAttr(func, "argNames", base + addedInPorts);
 
     argReplacements[i] = memIOTypes;
   }
