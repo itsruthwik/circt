@@ -1678,8 +1678,24 @@ class HandshakeLoweringSSAStrategy : public SSAMaximizationStrategy {
     return !isa<mlir::MemRefType>(arg.getType());
   }
 
-  /// Filters out allocation operations
-  bool maximizeOp(Operation *op) override { return !isAllocOp(op); }
+  /// Filters out allocation operations and any operation that produces a
+  /// memref-typed result. A memref value must never be threaded through block
+  /// arguments: insertMergeOps deliberately skips memref block arguments
+  /// (memories are handled separately by the memory-interface lowering), so a
+  /// maximized memref result would become a block argument that
+  /// removeBlockOperands later erases while it is still used by a branch
+  /// terminator -- aborting with "Cannot destroy a value that still has uses".
+  /// Besides allocations this covers memref views (memref.reinterpret_cast,
+  /// subview, cast, ...) that flow across blocks; they dominate their uses in
+  /// the incoming SSA, so leaving them un-maximized keeps the IR valid.
+  bool maximizeOp(Operation *op) override {
+    if (isAllocOp(op))
+      return false;
+    for (Value res : op->getResults())
+      if (isa<mlir::MemRefType>(res.getType()))
+        return false;
+    return true;
+  }
 };
 } // namespace
 
