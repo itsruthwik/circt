@@ -1593,6 +1593,23 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
                                ld_count, cntrl_count, lsq, mem_count++,
                                memrefOperand);
 
+    // If this internal memory is backed by a constant global (a ROM), capture
+    // its initializer so downstream HW lowering can emit an initialized ROM
+    // instead of an uninitialized memory. The MemoryOp does not retain the
+    // memref/get_global link, so stash the dense init as an attribute here.
+    if (!isExternalMemory) {
+      if (auto getGlobal =
+              memrefOperand.getDefiningOp<mlir::memref::GetGlobalOp>()) {
+        if (auto global = dyn_cast_or_null<mlir::memref::GlobalOp>(
+                SymbolTable::lookupNearestSymbolFrom(
+                    getGlobal, getGlobal.getNameAttr()))) {
+          if (global.getConstant() && global.getInitialValue().has_value())
+            if (auto els = dyn_cast<ElementsAttr>(*global.getInitialValue()))
+              newOp->setAttr("vtr.rom_init", els);
+        }
+      }
+    }
+
     setLoadDataInputs(memory.second, newOp);
 
     if (!lsq) {

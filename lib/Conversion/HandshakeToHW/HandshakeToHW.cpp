@@ -1552,6 +1552,33 @@ public:
     auto c0I0 = s.constant(0, 0);
 
     auto cl2dim = llvm::Log2_64_Ceil(op.getMemRefType().getShape()[0]);
+
+    // Constant global (ROM): if this memory carries a captured initializer and
+    // has no store ports, lower it to a combinational array-mux ROM (hw.array
+    // + hw.array_get) rather than an uninitialized seq.hlmem. This is directly
+    // synthesizable and needs no init file. The initializer is attached by the
+    // CFToHandshake memory lowering (attribute "vtr.rom_init").
+    if (auto romInit = op->getAttrOfType<ElementsAttr>("vtr.rom_init")) {
+      if (stCount == 0) {
+        int64_t numElems = op.getMemRefType().getShape()[0];
+        SmallVector<APInt> vals(romInit.getValues<APInt>().begin(),
+                                romInit.getValues<APInt>().end());
+        // hw.array_create lists elements high-index-first, so reverse.
+        SmallVector<Value> elems;
+        elems.reserve(numElems);
+        for (int64_t i = numElems - 1; i >= 0; --i)
+          elems.push_back(s.constant(vals[i]));
+        auto array = s.arrayCreate(elems);
+        for (auto &ld : loadPorts) {
+          Value idx = s.truncate(ld.addr.data, cl2dim);
+          ld.data.data->setValue(s.arrayGet(array, idx));
+          ld.done.data->setValue(c0I0);
+          buildForkLogic(s, bb, ld.addr, {ld.data, ld.done});
+        }
+        return;
+      }
+    }
+
     auto hlmem = seq::HLMemOp::create(
         s.b, loc, s.clk, s.rst,
         "_handshake_memory_" + std::to_string(op.getId()),

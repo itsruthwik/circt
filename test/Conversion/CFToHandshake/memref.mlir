@@ -141,3 +141,19 @@ func.func @dma(%1 : index) {
   memref.dma_wait %tag[%c0], %c1 : memref<1xi32>
   return
 }
+
+// -----
+
+// A load from a constant global (ROM) must carry the global's dense initializer
+// onto the memory op as the "vtr.rom_init" attribute, so HW lowering can emit an
+// initialized ROM. The get_global -> global link is not retained on the memory
+// op, so this capture happens here.
+// CHECK-LABEL:   handshake.func @rom_load(
+// CHECK:           memory[ld = 1, st = 0]
+// CHECK-SAME:        vtr.rom_init = dense<[10, 20, 30, 40]>
+memref.global "private" constant @T : memref<4xi32> = dense<[10, 20, 30, 40]>
+func.func @rom_load(%i: index) -> i32 {
+  %g = memref.get_global @T : memref<4xi32>
+  %v = memref.load %g[%i] : memref<4xi32>
+  return %v : i32
+}
