@@ -861,7 +861,14 @@ LoopNetworkRewriter::processRegion(Region &r,
   DominanceInfo domInfo(op);
   CFGLoopInfo loopInfo(domInfo.getDomTree(&r));
 
-  for (CFGLoop *loop : loopInfo.getTopLevelLoops()) {
+  // Prime EVERY loop, not just the outermost ones. A handshake loop needs an
+  // initial token on its control mux to start circulating; only priming the
+  // top-level loops leaves a nested loop's recurrence un-primed, so a
+  // data-dependent inner loop (e.g. gcd's inner ctz loops) never starts and the
+  // circuit deadlocks. getLoopsInPreorder() visits loops outer-first, which is
+  // the safe order (the outer loop's control rebuild does not touch a nested
+  // loop's header/latch blocks; block structure is preserved throughout).
+  for (CFGLoop *loop : loopInfo.getLoopsInPreorder()) {
     if (!loop->getLoopLatch())
       return emitError(op->getLoc()) << "Multiple loop latches detected "
                                         "(backedges from within the loop "
@@ -869,7 +876,6 @@ LoopNetworkRewriter::processRegion(Region &r,
                                         "pipelining is only supported for "
                                         "loops with unified loop latches.";
 
-    // This is the start of an outer loop - go process!
     if (failed(processOuterLoop(op->getLoc(), loop)))
       return failure();
   }
