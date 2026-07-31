@@ -5,6 +5,7 @@ add_circt_dialect_library(CIRCTHandshakeTransforms
   LockFunctions.cpp
   LowerExtmemToHW.cpp
   Materialization.cpp
+  RecurrenceReport.cpp
   SplitMerges.cpp
 
   DEPENDS

@@ -35,6 +35,28 @@ def HandshakeOpCount : Pass<"handshake-op-count", "mlir::ModuleOp"> {
   let constructor = "circt::handshake::createHandshakeOpCountPass()";
 }
 
+def HandshakeRecurrenceReport : Pass<"handshake-recurrence-report", "mlir::ModuleOp"> {
+  let summary = "Report the dataflow recurrences of a handshake function.";
+  let description = [{
+    This pass analyses each handshake.func operation and reports its dataflow
+    recurrences (cyclic strongly-connected components of the def-use graph),
+    together with the buffers placed on each one and the latency they imply.
+
+    A circuit's throughput is bounded by its recurrences, so the buffers on a
+    cycle -- not the buffers elsewhere -- determine the achievable initiation
+    interval. The report gives both the latency as lowered today and the latency
+    that would be achievable if `fifo` buffers were lowered transparently, as
+    the dialect documents them.
+
+    The pass never mutates the IR.
+  }];
+  let constructor = "circt::handshake::createHandshakeRecurrenceReportPass()";
+  let options = [
+    Option<"format", "format", "std::string", "\"text\"",
+           "Output format. Possible values are: text (default), json">,
+  ];
+}
+
 def HandshakeMaterializeForksSinks : Pass<"handshake-materialize-forks-sinks", "handshake::FuncOp"> {
   let summary = "Materialize fork and sink operations.";
   let description = [{
