@@ -1,11 +1,13 @@
 // RUN: circt-opt -handshake-insert-buffers="strategy=minimal buffer-size=1" %s | circt-opt -handshake-insert-buffers="strategy=minimal buffer-size=1" | FileCheck %s
 
 // The `minimal` strategy places a buffer on every merge-like output (where
-// dataflow cycles close) and on every memory response channel (load data and
-// completion tokens), and nowhere else. Running the pass twice checks that it
-// is idempotent.
+// dataflow cycles close), on every region argument that can carry a token (a
+// fan-out there feeds branches that reconverge at different depths), and on
+// every memory response channel (load data and completion tokens) -- and
+// nowhere else. Running the pass twice checks that it is idempotent.
 
 // CHECK-LABEL: handshake.func @memoryResponses(
+// CHECK:     buffer [1] fifo %arg1 : none
 handshake.func @memoryResponses(%mem: memref<4xi32>, %ctrl: none, ...) -> none {
   // Both the load data and the completion token of the memory are responses.
   // CHECK:     %[[MEM:.*]]:2 = extmemory
@@ -32,6 +34,7 @@ handshake.func @memoryResponses(%mem: memref<4xi32>, %ctrl: none, ...) -> none {
 }
 
 // CHECK-LABEL: handshake.func @cyclicMerge(
+// CHECK:     buffer [1] fifo %arg0 : none
 handshake.func @cyclicMerge(%ctrl: none, ...) -> i32 {
   %c0 = constant %ctrl {value = 0 : i32} : i32
   %c1 = constant %ctrl {value = 1 : i32} : i32

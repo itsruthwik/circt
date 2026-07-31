@@ -257,6 +257,15 @@ static void bufferMinimalStrategy(Region &r, OpBuilder &builder,
 
   bufferCyclesStrategy(r, builder, numSlots);
 
+  // A region argument that fans out feeds branches which reconverge later, at a
+  // merge or at the terminator. Those branches are rarely the same depth, so
+  // without slack at the fork the shallow one stalls waiting for the deep one
+  // and the region deadlocks. Argument buffers sit outside every loop, so they
+  // cost constant latency rather than latency per iteration.
+  for (auto &arg : r.getArguments())
+    if (shouldBufferArgument(arg))
+      insertBuffer(arg.getLoc(), arg, builder, numSlots, BufferTypeEnum::fifo);
+
   SmallVector<Value> responses;
   for (Operation &op : r.getOps())
     collectMemoryResponses(&op, responses);
