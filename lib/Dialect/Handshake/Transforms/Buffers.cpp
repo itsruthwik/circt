@@ -14,6 +14,7 @@
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/Handshake/HandshakeUtils.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -57,11 +58,17 @@ struct HandshakeRemoveBuffersPass
   };
 };
 } // namespace
+// Returns true if a value lowers down to a handshake bundle, and so is
+// something a buffer can be placed on.
+static bool isDataflowChannel(Value v) {
+  return v.getType().isIntOrFloat() || isa<NoneType>(v.getType());
+}
+
 // Returns true if a block argument should have buffers added to its uses.
 static bool shouldBufferArgument(BlockArgument arg) {
   // At the moment, buffers only make sense on arguments which we know
   // will lower down to a handshake bundle.
-  return arg.getType().isIntOrFloat() || isa<NoneType>(arg.getType());
+  return isDataflowChannel(arg);
 }
 
 static bool isUnbufferedChannel(Operation *definingOp, Operation *usingOp) {
@@ -85,8 +92,15 @@ static void insertBuffer(Location loc, Value operand, OpBuilder &builder,
 static void bufferResults(OpBuilder &builder, Operation *op, unsigned numSlots,
                           BufferTypeEnum bufferType) {
   for (auto res : op->getResults()) {
-    Operation *user = *res.getUsers().begin();
-    if (isa<handshake::BufferOp>(user))
+    // A result with no users has no channel to buffer, and a result whose every
+    // user is already a buffer is buffered. Note that `insertBuffer` rewrites
+    // all non-buffer uses at once, so a partially buffered result still only
+    // needs one more buffer.
+    if (res.use_empty())
+      continue;
+    if (llvm::all_of(res.getUsers(), [](Operation *user) {
+          return isa<handshake::BufferOp>(user);
+        }))
       continue;
     insertBuffer(op->getLoc(), res, builder, numSlots, bufferType);
   }
@@ -178,6 +192,86 @@ static void bufferAllFIFOStrategy(Region &r, OpBuilder &builder,
                     /*bufferType=*/BufferTypeEnum::fifo);
 }
 
+// Collects the values on which `op` returns a memory response: the data a load
+// hands back, and the completion tokens of loads and stores. The latency of
+// these values is determined outside the dataflow graph, so a consumer has to
+// be decoupled from them.
+static void collectMemoryResponses(Operation *op,
+                                   SmallVectorImpl<Value> &responses) {
+  auto addPorts = [&](auto memOp) {
+    for (const MemLoadInterface &ld : memOp.getLoadPorts()) {
+      responses.push_back(ld.dataOut);
+      responses.push_back(ld.doneOut);
+    }
+    for (const MemStoreInterface &st : memOp.getStorePorts())
+      responses.push_back(st.doneOut);
+  };
+
+  // Use the port accessors rather than re-deriving the result index arithmetic.
+  if (auto memOp = dyn_cast<handshake::MemoryOp>(op))
+    return addPorts(memOp);
+  if (auto memOp = dyn_cast<handshake::ExternalMemoryOp>(op))
+    return addPorts(memOp);
+
+  // A load's address results travel *to* the memory and are part of the
+  // request, not the response; only the data result is a response.
+  if (auto loadOp = dyn_cast<handshake::LoadOp>(op)) {
+    responses.push_back(loadOp.getDataResult());
+    return;
+  }
+
+  // Any other operation that touches memory - including memory operations from
+  // dialects this pass knows nothing about - is classified by its declared
+  // memory effects.
+  auto effects = dyn_cast<MemoryEffectOpInterface>(op);
+  if (!effects || (!effects.hasEffect<MemoryEffects::Read>() &&
+                   !effects.hasEffect<MemoryEffects::Write>()))
+    return;
+  for (Value res : op->getResults())
+    if (isDataflowChannel(res))
+      responses.push_back(res);
+}
+
+// Buffer merge-like outputs, which is where dataflow cycles close, plus every
+// memory response channel.
+//
+// This is the smallest placement observed to keep kernels live. It was derived
+// by repeatedly dropping buffers from the `allFIFO` placement until a kernel
+// deadlocked: every buffer that turned out to be load-bearing was either on a
+// merge-like output or on a memory response. Those locally-minimal sets are not
+// unique (the search is greedy and order-dependent), so this strategy is a
+// superset of them rather than a true minimum - but it is 60-75% smaller than
+// `all`/`allFIFO`, and every buffer removed is a cycle of latency removed from
+// whatever recurrence it sat on.
+static void bufferMinimalStrategy(Region &r, OpBuilder &builder,
+                                  unsigned numSlots) {
+  // `inCycle` walks def-use edges and does not follow block arguments, so a
+  // cycle closed through one would go unnoticed and the region would be
+  // under-buffered. After `lower-cf-to-handshake` a handshake function is a
+  // single block; say so rather than silently under-placing.
+  if (!r.hasOneBlock())
+    r.getParentOp()->emitWarning()
+        << "buffer strategy 'minimal' may under-place buffers in a region with "
+           "more than one block: cycles through block arguments are not "
+           "detected";
+
+  bufferCyclesStrategy(r, builder, numSlots);
+
+  SmallVector<Value> responses;
+  for (Operation &op : r.getOps())
+    collectMemoryResponses(&op, responses);
+
+  for (Value res : responses) {
+    if (res.use_empty())
+      continue;
+    if (llvm::all_of(res.getUsers(), [](Operation *user) {
+          return isa<handshake::BufferOp>(user);
+        }))
+      continue;
+    insertBuffer(res.getLoc(), res, builder, numSlots, BufferTypeEnum::fifo);
+  }
+}
+
 static LogicalResult bufferRegion(Region &r, OpBuilder &builder,
                                   StringRef strategy, unsigned bufferSize) {
   if (strategy == "cycles")
@@ -186,6 +280,8 @@ static LogicalResult bufferRegion(Region &r, OpBuilder &builder,
     bufferAllStrategy(r, builder, bufferSize);
   else if (strategy == "allFIFO")
     bufferAllFIFOStrategy(r, builder, bufferSize);
+  else if (strategy == "minimal")
+    bufferMinimalStrategy(r, builder, bufferSize);
   else
     return r.getParentOp()->emitOpError()
            << "Unknown buffer strategy: " << strategy;

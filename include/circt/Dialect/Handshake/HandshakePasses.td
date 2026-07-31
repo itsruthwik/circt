@@ -119,7 +119,7 @@ def HandshakeInsertBuffers
   let constructor = "circt::handshake::createHandshakeInsertBuffersPass()";
   let options = [
     Option<"strategy", "strategy", "std::string", "\"all\"",
-           "Strategy to apply. Possible values are: cycles, allFIFO, all (default)">,
+           "Strategy to apply. Possible values are: cycles, minimal, allFIFO, all (default)">,
     Option<"bufferSize", "buffer-size", "unsigned", /*default=*/"2",
            "Number of slots in each buffer">,
   ];
