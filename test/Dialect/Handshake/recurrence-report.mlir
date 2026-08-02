@@ -11,12 +11,19 @@
 // and one from the mux arm entering from outside the loop -- so two slots over
 // two tokens gives a recurrence bound of 1.
 
+// Channels are reported by SSA name so a buffer in the report can be found in
+// the function it came from, and split into those closing a recurrence and
+// those on none -- buffering the latter cannot move any II.
+
 // CHECK-LABEL: handshake.func @seqRecurrence: 2 recurrence(s)
 // CHECK:         recurrence 0: 6 ops, 2 seq buffer(s) (2 slot(s)), 0 fifo buffer(s) (0 slot(s)), 1 init token(s)
 // CHECK:         II: 1.00  |  if fifo were transparent: 1.00
 // CHECK:         slots over whole component: 2 (as lowered), 2 (if fifo were transparent)
+// CHECK:         channels closing it (6): %4 %7 %5 %9 %trueResult %8
 
 // JSON: "function": "seqRecurrence"
+// JSON: "off-recurrence-channels"
+// JSON: "channels"
 // JSON: "ii": 1
 // JSON: "ii-if-fifo-transparent": 1
 handshake.func @seqRecurrence(%arg0: none, ...) -> (i32, none) {
@@ -41,6 +48,12 @@ handshake.func @seqRecurrence(%arg0: none, ...) -> (i32, none) {
 
 // CHECK:         recurrence 1: 2 ops, 0 seq buffer(s) (0 slot(s)), 0 fifo buffer(s) (0 slot(s)), 0 init token(s)
 // CHECK:         II: 0.00  |  if fifo were transparent: 0.00
+// CHECK:         channels closing it (2): %6 %trueResult_0
+
+// Every channel that closes no recurrence is reported too: buffering those
+// trades area for slack without moving any II.
+
+// CHECK:       channels off every recurrence: 7 (buffering these cannot change any II)
 
 // The same loop with the index buffer typed `fifo`. As lowered it still costs a
 // cycle, so the II is unchanged; were fifo buffers lowered transparently, as

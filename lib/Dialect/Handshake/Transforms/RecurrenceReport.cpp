@@ -40,6 +40,7 @@
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Support/LLVM.h"
 #include "circt/Support/SparseOpSCC.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
@@ -122,7 +123,30 @@ struct Recurrence {
   InitiationInterval ii;
   /// II if `fifo` buffers were lowered transparently, as the dialect documents.
   InitiationInterval iiIfFifoTransparent;
+  /// Channels closing this recurrence: values whose producer and at least one
+  /// consumer both lie in this component. A buffer placed on one of these adds
+  /// to the recurrence's II; a buffer placed anywhere else cannot.
+  SmallVector<Value> channels;
 };
+
+/// The recurrences of one function, plus the channels they span.
+struct FuncRecurrences {
+  SmallVector<Recurrence> recurrences;
+  /// Every channel on any recurrence, deduplicated.
+  SetVector<Value> onRecurrence;
+  /// Channels on no recurrence. Buffering these trades area for slack without
+  /// touching any initiation interval.
+  SmallVector<Value> offRecurrence;
+};
+
+/// Print `v` as it appears in the IR (`%7`, `%arg0`, ...), so a reported channel
+/// can be found in the function it came from.
+static std::string ssaName(Value v, AsmState &state) {
+  std::string name;
+  llvm::raw_string_ostream os(name);
+  v.printAsOperand(os, state);
+  return os.str();
+}
 
 /// Collect the buffers carried by a set of ops forming a recurrence.
 static BufferInventory inventoryBuffers(ArrayRef<Operation *> ops) {
@@ -304,7 +328,7 @@ static InitiationInterval computeII(ArrayRef<Operation *> ops,
 /// Nodes are operations; an edge runs from an op to each user of its results.
 /// The traversal is confined to the function body so that it neither escapes
 /// into enclosing regions nor descends into unrelated ones.
-static SmallVector<Recurrence> findRecurrences(handshake::FuncOp func) {
+static FuncRecurrences findRecurrences(handshake::FuncOp func) {
   Region &body = func.getBody();
 
   auto isDataflowEdge = [&body](Operation *op, OpOperand &operand) {
@@ -332,7 +356,7 @@ static SmallVector<Recurrence> findRecurrences(handshake::FuncOp func) {
     for (Operation &op : block)
       sccs.visit(&op);
 
-  SmallVector<Recurrence> recurrences;
+  FuncRecurrences result;
   for (OpSCC entry : sccs.topological()) {
     auto cyclic = dyn_cast<CyclicOpSCC>(entry);
     if (!cyclic)
@@ -342,16 +366,61 @@ static SmallVector<Recurrence> findRecurrences(handshake::FuncOp func) {
     rec.buffers = inventoryBuffers(rec.ops);
     rec.ii = computeII(rec.ops, /*fifoIsTransparent=*/false);
     rec.iiIfFifoTransparent = computeII(rec.ops, /*fifoIsTransparent=*/true);
-    recurrences.push_back(std::move(rec));
+
+    // A channel closes the recurrence when its producer and one of its
+    // consumers are both members. Mirror the edge model used to find the
+    // components, or the response half of a memory pair would be counted as
+    // part of a cycle it does not actually close.
+    DenseSet<Operation *> members(rec.ops.begin(), rec.ops.end());
+    for (Operation *op : rec.ops) {
+      bool isMemory = isa<handshake::MemoryOp, handshake::ExternalMemoryOp>(op);
+      for (Value res : op->getResults()) {
+        if (isMemory && !isa<NoneType>(res.getType()))
+          continue;
+        if (llvm::any_of(res.getUsers(), [&](Operation *user) {
+              return members.contains(user);
+            })) {
+          rec.channels.push_back(res);
+          result.onRecurrence.insert(res);
+        }
+      }
+    }
+    result.recurrences.push_back(std::move(rec));
   }
-  return recurrences;
+
+  // Everything else that can carry a token is off every recurrence.
+  auto isChannel = [](Value v) {
+    return v.getType().isIntOrFloat() || isa<NoneType>(v.getType());
+  };
+  for (BlockArgument arg : body.getArguments())
+    if (isChannel(arg) && !result.onRecurrence.contains(arg))
+      result.offRecurrence.push_back(arg);
+  for (Block &block : body)
+    for (Operation &op : block)
+      for (Value res : op.getResults())
+        if (isChannel(res) && !res.use_empty() &&
+            !result.onRecurrence.contains(res))
+          result.offRecurrence.push_back(res);
+
+  return result;
 }
 
 /// Render one recurrence as JSON.
-static llvm::json::Value toJSON(const Recurrence &rec, unsigned id) {
+static llvm::json::Value toJSON(const Recurrence &rec, unsigned id,
+                                AsmState &state) {
   llvm::json::Array opNames;
-  for (Operation *op : rec.ops)
-    opNames.push_back(op->getName().getStringRef());
+  for (Operation *op : rec.ops) {
+    // Name the op by its first result where it has one, so a reported
+    // recurrence can be traced back to specific values in the function.
+    std::string name = op->getName().getStringRef().str();
+    if (op->getNumResults() > 0)
+      name = ssaName(op->getResult(0), state) + " = " + name;
+    opNames.push_back(std::move(name));
+  }
+
+  llvm::json::Array channelNames;
+  for (Value v : rec.channels)
+    channelNames.push_back(ssaName(v, state));
 
   // A null II means no token source could be identified, so the ratio is
   // undetermined -- not that the recurrence is known to deadlock.
@@ -366,6 +435,7 @@ static llvm::json::Value toJSON(const Recurrence &rec, unsigned id) {
       {"id", id},
       {"size", static_cast<int64_t>(rec.ops.size())},
       {"ops", std::move(opNames)},
+      {"channels", std::move(channelNames)},
       {"seq-buffers", inv.seqBuffers},
       {"fifo-buffers", inv.fifoBuffers},
       {"seq-slots", inv.seqSlots},
@@ -380,7 +450,7 @@ static llvm::json::Value toJSON(const Recurrence &rec, unsigned id) {
 
 /// Render one recurrence as human-readable text.
 static void printRecurrence(llvm::raw_ostream &os, const Recurrence &rec,
-                            unsigned id) {
+                            unsigned id, AsmState &state) {
   auto printII = [&os](const InitiationInterval &ii) {
     if (ii.noTokenSource)
       os << "undetermined (no token source identified on some cycle)";
@@ -403,9 +473,17 @@ static void printRecurrence(llvm::raw_ostream &os, const Recurrence &rec,
   os << "    slots over whole component: " << inv.latencyAsLowered()
      << " (as lowered), " << inv.latencyIfFifoTransparent()
      << " (if fifo were transparent)\n";
+  os << "    channels closing it (" << rec.channels.size() << "):";
+  for (Value v : rec.channels)
+    os << " " << ssaName(v, state);
+  os << "\n";
   os << "    ops:";
-  for (Operation *op : rec.ops)
-    os << " " << op->getName();
+  for (Operation *op : rec.ops) {
+    os << " ";
+    if (op->getNumResults() > 0)
+      os << ssaName(op->getResult(0), state) << "=";
+    os << op->getName();
+  }
   os << "\n";
 }
 
@@ -441,16 +519,22 @@ struct HandshakeRecurrenceReportPass
             << " blocks; recurrences closing through block arguments are not "
                "detected and this report may be incomplete";
 
-      SmallVector<Recurrence> recurrences = findRecurrences(func);
+      FuncRecurrences found = findRecurrences(func);
+      ArrayRef<Recurrence> recurrences = found.recurrences;
+      AsmState state(func);
 
       if (emitJSON) {
         llvm::json::Array recsJSON;
         for (const auto &[id, rec] : llvm::enumerate(recurrences))
-          recsJSON.push_back(toJSON(rec, id));
+          recsJSON.push_back(toJSON(rec, id, state));
+        llvm::json::Array offJSON;
+        for (Value v : found.offRecurrence)
+          offJSON.push_back(ssaName(v, state));
         funcsJSON.push_back(llvm::json::Object{
             {"function", func.getName()},
             {"blocks", numBlocks},
             {"recurrences", std::move(recsJSON)},
+            {"off-recurrence-channels", std::move(offJSON)},
         });
         continue;
       }
@@ -458,7 +542,9 @@ struct HandshakeRecurrenceReportPass
       os << "handshake.func @" << func.getName() << ": " << recurrences.size()
          << " recurrence(s)\n";
       for (const auto &[id, rec] : llvm::enumerate(recurrences))
-        printRecurrence(os, rec, id);
+        printRecurrence(os, rec, id, state);
+      os << "  channels off every recurrence: " << found.offRecurrence.size()
+         << " (buffering these cannot change any II)\n";
     }
 
     if (emitJSON)
