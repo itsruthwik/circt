@@ -43,7 +43,7 @@ struct LoweringOptionsOption
             llvm::cl::desc(
                 "Style options.  Valid flags include: "
                 "noAlwaysComb, exprInEventControl, disallowPackedArrays, "
-                "disallowPackedStructAssignments, "
+                "disallowPackedStructs, disallowPackedStructAssignments, "
                 "disallowLocalVariables, verifLabels, emittedLineLength=<n>, "
                 "maximumNumberOfTermsPerExpression=<n>, "
                 "explicitBitcast, emitReplicatedOpsToHeader, "

@@ -82,6 +82,12 @@ The current set of "tool capability" Lowering Options is:
    forced to be simple wires. Some EDA tools rely on these being simple wires.
  * `disallowPackedArrays` (default=`false`).  If true, eliminate packed arrays
    for tools that don't support them (e.g. Yosys).
+ * `disallowPackedStructs` (default=`false`).  If true, eliminate packed structs
+   for tools that don't support them (e.g. Yosys).  Struct-typed values are
+   replaced by bit slicing of the equivalent flat vector; a struct that cannot be
+   lowered is an error rather than invalid output.  Note this is distinct from
+   `disallowPackedStructAssignments`, which keeps the struct type and only
+   changes how it is assigned.
  * `disallowPackedStructAssignments` (default=`false`). If true, eliminate packed
     struct assignments in favor of a wire + assignments to the individual fields.
  * `disallowLocalVariables` (default=`false`).  If true, do not emit
@@ -182,10 +188,12 @@ Vivado (at least 2020.2, 2021.2, and 2022.2) has a bug in constant propagation,
 and this option helps to create a wire with the desired behavior.
 
 ### Yosys
-For Yosys, we recommend using the `disallowLocalVariables` and `disallowPackedArrays`
-options. Yosys doesn't parse `automatic` variables, so `disallowLocalVariables` is
-required. Additionally, Yosys doesn't accept packed arrays, so we suggest using
-`disallowPackedArrays`.
+For Yosys, we recommend using the `disallowLocalVariables`, `disallowPackedArrays`
+and `disallowPackedStructs` options. Yosys doesn't parse `automatic` variables, so
+`disallowLocalVariables` is required. Additionally, Yosys doesn't accept packed
+arrays, so we suggest using `disallowPackedArrays`. Yosys' Verilog front end also
+rejects `struct packed` declarations outright, so `disallowPackedStructs` is
+required for any design whose ports or values carry struct types.
 
 
 ### Specifying `LoweringOptions` in a front-end HDL tool

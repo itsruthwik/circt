@@ -41,6 +41,8 @@ def HWLegalizeModules : Pass<"hw-legalize-modules", "hw::HWModuleOp"> {
       constructs.
   }];
 
+  // Lowering a packed struct away replaces it with comb bit slicing.
+  let dependentDialects = ["circt::comb::CombDialect"];
 }
 
 def PrettifyVerilog : Pass<"prettify-verilog", "hw::HWModuleOp"> {

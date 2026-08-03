@@ -51,7 +51,9 @@ private:
   Value lowerLookupToCasez(Operation &op, Value input, Value index,
                            mlir::Type elementType,
                            SmallVector<Value> caseValues);
-  bool processUsers(Operation &op, Value value, ArrayRef<Value> mapping);
+  bool tryLoweringPackedStructOp(Operation &op);
+  bool processUsers(Operation &op, Value value, ArrayRef<Value> mapping,
+                    StringRef aggregateKind);
   std::optional<std::pair<uint64_t, unsigned>>
   tryExtractIndexAndBitWidth(Value value);
   bool tryLoweringClockedAssertLike(Operation &op);
@@ -87,7 +89,7 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
                 builder, constOp.getLoc(), constOp.getType(),
                 cast<ArrayAttr>(field)));
         }
-        if (!processUsers(op, constOp.getResult(), inputs))
+        if (!processUsers(op, constOp.getResult(), inputs, "array"))
           return false;
 
         // Remove original op.
@@ -105,7 +107,7 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
             values.push_back(value);
           }
         }
-        if (!processUsers(op, concatOp.getResult(), values))
+        if (!processUsers(op, concatOp.getResult(), values, "array"))
           return false;
 
         // Remove original op.
@@ -114,7 +116,7 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
       .Case<hw::ArrayCreateOp>([&](hw::ArrayCreateOp createOp) {
         // Replace individual element uses (if any) with input arguments.
         SmallVector<Value> inputs(llvm::reverse(createOp.getInputs()));
-        if (!processUsers(op, createOp.getResult(), inputs))
+        if (!processUsers(op, createOp.getResult(), inputs, "array"))
           return false;
 
         // Remove original op.
@@ -221,7 +223,7 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
         }
 
         // Fix users to refer to individual element regs.
-        if (!processUsers(op, regOp.getResult(), elements))
+        if (!processUsers(op, regOp.getResult(), elements, "array"))
           return false;
 
         // Remove original reg.
@@ -250,10 +252,77 @@ bool HWLegalizeModulesPass::tryLoweringPackedArrayOp(Operation &op) {
                                   trueValue, falseValue, muxOp.getTwoState()));
         }
 
-        if (!processUsers(op, muxOp.getResult(), muxedValues))
+        if (!processUsers(op, muxOp.getResult(), muxedValues, "array"))
           return false;
 
         // Remove original mux.
+        return true;
+      })
+      .Default([&](auto op) { return false; });
+}
+
+/// Split a struct-typed value into one Value per field, in field declaration
+/// order, given the flat bit vector the struct is laid out over.  Returns
+/// failure if any field has no known bit width or is itself an aggregate, so
+/// that the caller reports the op rather than emitting a mis-sliced value.
+static bool explodeStructToBits(OpBuilder &builder, Location loc, Value bits,
+                                hw::StructType structType,
+                                SmallVectorImpl<Value> &fields) {
+  int64_t totalBitWidth = hw::getBitWidth(structType);
+  if (totalBitWidth < 0)
+    return false;
+
+  // The first field occupies the MSBs -- the same convention hw.struct_create
+  // lowers to (a comb.concat whose first operand is the high bits).  Note this
+  // is the opposite of the array cases above, which reverse their operands
+  // because array index 0 is the *last* operand; reversing here would silently
+  // swap fields.
+  int64_t consumedBits = 0;
+  for (const auto &element : structType.getElements()) {
+    if (!isa<IntegerType>(element.type))
+      return false;
+    int64_t fieldWidth = hw::getBitWidth(element.type);
+    if (fieldWidth < 0)
+      return false;
+    int64_t bitOffset = totalBitWidth - consumedBits - fieldWidth;
+    fields.push_back(
+        comb::ExtractOp::create(builder, loc, bits, bitOffset, fieldWidth));
+    consumedBits += fieldWidth;
+  }
+  return true;
+}
+
+bool HWLegalizeModulesPass::tryLoweringPackedStructOp(Operation &op) {
+  return TypeSwitch<Operation *, bool>(&op)
+      .Case<hw::BitcastOp>([&](hw::BitcastOp bitcastOp) {
+        auto structType = hw::type_dyn_cast<hw::StructType>(bitcastOp.getType());
+        if (!structType)
+          return false;
+        // Only a bitcast *from* a flat integer can be turned into bit slices.
+        // Anything else falls through to the error path rather than being
+        // sliced as if it were one.
+        Value input = bitcastOp.getInput();
+        if (!isa<IntegerType>(input.getType()))
+          return false;
+
+        SmallVector<Value> fields;
+        OpBuilder builder(bitcastOp);
+        if (!explodeStructToBits(builder, bitcastOp.getLoc(), input, structType,
+                                 fields))
+          return false;
+        if (!processUsers(op, bitcastOp.getResult(), fields, "struct"))
+          return false;
+
+        // Remove original op.
+        return true;
+      })
+      .Case<hw::StructCreateOp>([&](hw::StructCreateOp createOp) {
+        // The operands already are the fields, in declaration order.
+        SmallVector<Value> fields(createOp.getInput());
+        if (!processUsers(op, createOp.getResult(), fields, "struct"))
+          return false;
+
+        // Remove original op.
         return true;
       })
       .Default([&](auto op) { return false; });
@@ -329,9 +398,26 @@ Value HWLegalizeModulesPass::lowerLookupToCasez(Operation &op, Value input,
 }
 
 bool HWLegalizeModulesPass::processUsers(Operation &op, Value value,
-                                         ArrayRef<Value> mapping) {
+                                         ArrayRef<Value> mapping,
+                                         StringRef aggregateKind) {
   for (auto *user : llvm::make_early_inc_range(value.getUsers())) {
     if (TypeSwitch<Operation *, bool>(user)
+            .Case<hw::StructExplodeOp>([&](hw::StructExplodeOp explodeOp) {
+              // Results come out in field declaration order, which is the order
+              // `mapping` was built in.
+              if (explodeOp.getNumResults() != mapping.size())
+                return false;
+              for (auto [result, field] :
+                   llvm::zip(explodeOp.getResults(), mapping))
+                result.replaceAllUsesWith(field);
+              return true;
+            })
+            .Case<hw::StructExtractOp>([&](hw::StructExtractOp extractOp) {
+              if (extractOp.getFieldIndex() >= mapping.size())
+                return false;
+              extractOp.replaceAllUsesWith(mapping[extractOp.getFieldIndex()]);
+              return true;
+            })
             .Case<hw::ArrayGetOp>([&](hw::ArrayGetOp getOp) {
               if (auto indexAndBitWidth =
                       tryExtractIndexAndBitWidth(getOp.getIndex())) {
@@ -355,7 +441,7 @@ bool HWLegalizeModulesPass::processUsers(Operation &op, Value value,
       continue;
     }
 
-    user->emitError("unsupported packed array expression");
+    user->emitError("unsupported packed ") << aggregateKind << " expression";
     signalPassFailure();
     return false;
   }
@@ -437,6 +523,25 @@ void HWLegalizeModulesPass::processPostOrder(Block &body) {
       for (auto value : op.getResults()) {
         if (isa<hw::ArrayType>(value.getType())) {
           op.emitError("unsupported packed array expression");
+          signalPassFailure();
+        }
+      }
+    }
+
+    if (options.disallowPackedStructs) {
+      // Try supported packed struct op lowering.
+      if (tryLoweringPackedStructOp(op)) {
+        it = --Block::iterator(op);
+        op.erase();
+        anythingChanged = true;
+        continue;
+      }
+
+      // Otherwise, if the IR produces a packed struct and the target cannot
+      // parse one, reject the IR rather than emitting Verilog it will choke on.
+      for (auto value : op.getResults()) {
+        if (hw::type_isa<hw::StructType>(value.getType())) {
+          op.emitError("unsupported packed struct expression");
           signalPassFailure();
         }
       }

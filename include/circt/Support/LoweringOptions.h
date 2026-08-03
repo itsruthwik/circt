@@ -72,6 +72,14 @@ struct LoweringOptions {
   /// Yosys).
   bool disallowPackedArrays = false;
 
+  /// If true, eliminate packed structs for tools that don't support them (e.g.
+  /// Yosys, whose Verilog front end rejects `struct packed` outright).
+  /// Struct-typed values are replaced by bit slicing of the equivalent flat
+  /// vector; a struct that cannot be lowered is an error rather than invalid
+  /// output. Distinct from `disallowPackedStructAssignments`, which keeps the
+  /// struct type and only changes how it is assigned.
+  bool disallowPackedStructs = false;
+
   /// If true, eliminate packed struct assignments in favor of a wire +
   /// assignments to the individual fields.
   bool disallowPackedStructAssignments = false;
