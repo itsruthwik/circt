@@ -204,6 +204,15 @@ static std::string getSubModuleName(Operation *oldOp) {
   // Add memory ID.
   if (auto memOp = dyn_cast<handshake::MemoryOp>(oldOp))
     subModuleName += "_id" + std::to_string(memOp.getId());
+  // External memories with the same element type but different port shapes
+  // (e.g. a read-only ld=2/st=0 array vs a write-only ld=0/st=1 array) share the
+  // same discriminating types, so disambiguate by id (matching MemoryOp) plus
+  // the load/store counts. Without this the second extmemory reuses the first's
+  // extern module -> "incorrect # of replacement values".
+  if (auto extmemOp = dyn_cast<handshake::ExternalMemoryOp>(oldOp))
+    subModuleName += "_id" + std::to_string(extmemOp.getId()) + "_ld" +
+                     std::to_string(extmemOp.getLdCount()) + "_st" +
+                     std::to_string(extmemOp.getStCount());
 
   // Add compare kind.
   if (auto comOp = dyn_cast<mlir::arith::CmpIOp>(oldOp))
@@ -289,91 +298,6 @@ portToFieldInfo(llvm::ArrayRef<hw::PortInfo> portInfo) {
   return fieldInfo;
 }
 
-// Convert any handshake.extmemory operations and the top-level I/O
-// associated with these.
-static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
-  auto *ctx = mod.getContext();
-
-  // Gather memref ports to be converted.
-  llvm::DenseMap<unsigned, Value> memrefPorts;
-  for (auto [i, arg] : llvm::enumerate(mod.getBodyBlock()->getArguments())) {
-    auto channel = dyn_cast<esi::ChannelType>(arg.getType());
-    if (channel && isa<MemRefType>(channel.getInner()))
-      memrefPorts[i] = arg;
-  }
-
-  if (memrefPorts.empty())
-    return success(); // nothing to do.
-
-  OpBuilder b(mod);
-
-  auto getMemoryIOInfo = [&](Location loc, Twine portName, unsigned argIdx,
-                             ArrayRef<hw::PortInfo> info,
-                             hw::ModulePort::Direction direction) {
-    auto type = hw::StructType::get(ctx, portToFieldInfo(info));
-    auto portInfo =
-        hw::PortInfo{{b.getStringAttr(portName), type, direction}, argIdx};
-    return portInfo;
-  };
-
-  for (auto [i, arg] : memrefPorts) {
-    // Insert ports into the module
-    auto memName = mod.getArgName(i);
-
-    // Get the attached extmemory external module.
-    auto extmemInstance = cast<hw::InstanceOp>(*arg.getUsers().begin());
-    auto extmemMod =
-        cast<hw::HWModuleExternOp>(SymbolTable::lookupNearestSymbolFrom(
-            extmemInstance, extmemInstance.getModuleNameAttr()));
-
-    ModulePortInfo portInfo(extmemMod.getPortList());
-
-    // The extmemory external module's interface is a direct wrapping of the
-    // original handshake.extmemory operation in- and output types. Remove the
-    // first input argument (the !esi.channel<memref> op) since that is what
-    // we're replacing with a materialized interface.
-    portInfo.eraseInput(0);
-
-    // Add memory input - this is the output of the extmemory op.
-    SmallVector<PortInfo> outputs(portInfo.getOutputs());
-    auto inPortInfo =
-        getMemoryIOInfo(arg.getLoc(), memName.strref() + "_in", i, outputs,
-                        hw::ModulePort::Direction::Input);
-    mod.insertPorts({{i, inPortInfo}}, {});
-    auto newInPort = mod.getArgumentForInput(i);
-    // Replace the extmemory submodule outputs with the newly created inputs.
-    b.setInsertionPointToStart(mod.getBodyBlock());
-    auto newInPortExploded = hw::StructExplodeOp::create(
-        b, arg.getLoc(), extmemMod.getOutputTypes(), newInPort);
-    extmemInstance.replaceAllUsesWith(newInPortExploded.getResults());
-
-    // Add memory output - this is the inputs of the extmemory op (without the
-    // first argument);
-    unsigned outArgI = mod.getNumOutputPorts();
-    SmallVector<PortInfo> inputs(portInfo.getInputs());
-    auto outPortInfo =
-        getMemoryIOInfo(arg.getLoc(), memName.strref() + "_out", outArgI,
-                        inputs, hw::ModulePort::Direction::Output);
-
-    auto memOutputArgs = extmemInstance.getOperands().drop_front();
-    b.setInsertionPoint(mod.getBodyBlock()->getTerminator());
-    auto memOutputStruct = hw::StructCreateOp::create(
-        b, arg.getLoc(), outPortInfo.type, memOutputArgs);
-    mod.appendOutputs({{outPortInfo.name, memOutputStruct}});
-
-    // Erase the extmemory submodule instace since the i/o has now been
-    // plumbed.
-    extmemMod.erase();
-    extmemInstance.erase();
-
-    // Erase the original memref argument of the top-level i/o now that it's use
-    // has been removed.
-    mod.modifyPorts(/*insertInputs*/ {}, /*insertOutputs*/ {},
-                    /*eraseInputs*/ {i + 1}, /*eraseOutputs*/ {});
-  }
-
-  return success();
-}
 
 namespace {
 
@@ -704,6 +628,296 @@ static Value createZeroDataConst(RTLBuilder &s, Location loc, Type type) {
         assert(false);
         return {};
       });
+}
+
+// Free-function priority arbiter (behaviourally identical to
+// HandshakeConversionPattern::buildPriorityArbiter, which uses no `this`). Given
+// N 1-bit valid inputs it returns an N-bit one-hot grant selecting the
+// lowest-index valid input (0 if none valid). Used by convertExtMemoryOps to
+// serialize the N per-site memory accesses onto one consolidated port.
+static Value buildExtMemPriorityArbiter(RTLBuilder &s, ArrayRef<Value> valids,
+                                        Value defaultValue,
+                                        DenseMap<size_t, Value> &indexMapping) {
+  Value priorityArb = defaultValue;
+  size_t numInputs = valids.size();
+  for (size_t i = numInputs; i > 0; --i) {
+    size_t inputIndex = i - 1;
+    size_t oneHotIndex = size_t{1} << inputIndex;
+    Value constIndex = s.constant(numInputs, oneHotIndex);
+    indexMapping[inputIndex] = constIndex;
+    priorityArb = s.mux(valids[inputIndex], {priorityArb, constIndex});
+  }
+  return priorityArb;
+}
+
+// Convert any handshake.extmemory operations and the top-level I/O
+// associated with these.
+static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
+  auto *ctx = mod.getContext();
+
+  // Gather memref ports to be converted.
+  llvm::DenseMap<unsigned, Value> memrefPorts;
+  for (auto [i, arg] : llvm::enumerate(mod.getBodyBlock()->getArguments())) {
+    auto channel = dyn_cast<esi::ChannelType>(arg.getType());
+    if (channel && isa<MemRefType>(channel.getInner()))
+      memrefPorts[i] = arg;
+  }
+
+  if (memrefPorts.empty())
+    return success(); // nothing to do.
+
+  auto eqp = comb::ICmpPredicate::eq;
+
+  for (auto [i, arg] : memrefPorts) {
+    (void)i; // The captured index is stale after the first memref mutates the
+             // argument list (each memref inserts ld0.data/st0.done ports and
+             // erases its memref arg -> a net shift). Use the argument's LIVE
+             // index instead.
+    OpBuilder b(mod);
+    auto memName = mod.getArgName(cast<BlockArgument>(arg).getArgNumber()).str();
+    auto loc = arg.getLoc();
+    auto extmemInstance = cast<hw::InstanceOp>(*arg.getUsers().begin());
+    auto extmemMod = cast<hw::HWModuleExternOp>(
+        SymbolTable::lookupNearestSymbolFrom(extmemInstance,
+                                             extmemInstance.getModuleNameAttr()));
+
+    // Recover per-site counts. instance operands = memref + [stData,stAddr]*M +
+    // [ldAddr]*N ; results = [ldData]*N [stDone]*M [ldDone]*N.
+    unsigned A = extmemInstance.getNumOperands() - 1; // = 2M + N
+    unsigned Bc = extmemInstance.getNumResults();     // = 2N + M
+    assert((2 * Bc - A) % 3 == 0 && (2 * A - Bc) % 3 == 0 && "bad extmem shape");
+    unsigned N = (2 * Bc - A) / 3; // # loads
+    unsigned M = (2 * A - Bc) / 3; // # stores
+
+    // Clock/reset = last two module input ports (stable Values across port edits).
+    unsigned numInPre = mod.getNumInputPorts();
+    Value clk = mod.getBodyBlock()->getArgument(numInPre - 2);
+    Value rst = mod.getBodyBlock()->getArgument(numInPre - 1);
+
+    // Consolidated channel port types come straight from the per-site channels.
+    Type ldDataChanTy = N ? extmemInstance.getResult(0).getType() : Type();
+    Type stDoneChanTy = M ? extmemInstance.getResult(N).getType() : Type();
+    hw::StructType stStructTy;
+    if (M) {
+      Type addrInner =
+          cast<esi::ChannelType>(extmemInstance.getOperand(2).getType())
+              .getInner();
+      Type dataInner =
+          cast<esi::ChannelType>(extmemInstance.getOperand(1).getType())
+              .getInner();
+      stStructTy = hw::StructType::get(
+          ctx, {hw::StructType::FieldInfo{StringAttr::get(ctx, "address"),
+                                          addrInner},
+                hw::StructType::FieldInfo{StringAttr::get(ctx, "data"),
+                                          dataInner}});
+    }
+
+    // Normalize the module's port locations (stage-1 modules can carry null
+    // port locs, which crashes modifyModulePorts' setAllPortLocs on insert).
+    mod.setAllPortLocs(
+        SmallVector<Location>(mod.getNumPorts(), UnknownLoc::get(ctx)));
+
+    // Insert the consolidated INPUT ports (ld0.data, st0.done) before the memref
+    // arg; remember the memref's shifted index for later erase.
+    Value ldDataArg, stDoneArg;
+    unsigned insIdx = cast<BlockArgument>(arg).getArgNumber();
+    if (N) {
+      // insertInput (unlike insertPorts/modifyPorts) inserts the block argument
+      // alongside the module-type port, avoiding a type/body desync.
+      ldDataArg = mod.insertInput(insIdx, b.getStringAttr(memName + "_ld0.data"),
+                                  ldDataChanTy)
+                      .second;
+      ++insIdx;
+    }
+    if (M) {
+      stDoneArg = mod.insertInput(insIdx,
+                                  b.getStringAttr(memName + "_st0.done"),
+                                  stDoneChanTy)
+                      .second;
+      ++insIdx;
+    }
+    unsigned memrefArgIdx = insIdx;
+
+    // Build the arbiters just before the extmem instance.
+    b.setInsertionPoint(extmemInstance);
+    BackedgeBuilder bb(b, loc);
+    RTLBuilder s(hw::ModulePortInfo(mod.getPortList()), b, loc, clk, rst);
+    auto i1Ty = b.getI1Type();
+
+    // Correct one-hot mux over `ins`, selected by one-hot `grant`.
+    // NOTE: do NOT use RTLBuilder::ohMux here — its loop runs `i = size-1 .. 1`
+    // and never muxes in input[0], so a grant of 1<<0 (the lowest-index/highest-
+    // priority site) returns 0. That silently drops site 0 from the address
+    // select AND the fired/ready reduction, so a site-0 winner can never
+    // complete -> deadlock. This version includes index 0.
+    auto ohMux1 = [&](Value grant, ArrayRef<Value> ins) -> Value {
+      if (ins.size() == 1)
+        return ins[0];
+      Type t = ins[0].getType();
+      unsigned w = (t.isInteger(0) || isa<NoneType>(t))
+                       ? 0
+                       : t.getIntOrFloatBitWidth();
+      Value acc = s.constant(w, 0);
+      for (unsigned k = 0; k < ins.size(); ++k)
+        acc = s.mux(s.bit(grant, k), {acc, ins[k]});
+      return acc;
+    };
+
+    // Opaque 1-slot skid buffer: in.ready = !full, INDEPENDENT of out.ready, so
+    // it breaks the combinational path from the downstream's ready back to the
+    // arbiter. This is essential: the memory return feeds a transparent chain
+    // (handshake.load passes data.ready straight through) that loops back into
+    // the loop control, so gating the arbiter's advance on the downstream being
+    // ready deadlocks. With an opaque skid the arbiter advances the moment the
+    // returned datum is CAPTURED (skid empty), and the skid drains to the
+    // consumer at its own pace. Returns {inReady, outChannel}.
+    auto makeOpaqueSkid = [&](Value inData, Value inValid,
+                              const std::string &nm) -> std::pair<Value, Value> {
+      auto fullBE = bb.get(b.getI1Type());
+      Value full = s.reg(nm + "_full", fullBE, s.constant(1, 0));
+      Value inReady = s.bNot(full);
+      Value inFired = s.bAnd({inValid, inReady});
+      Value dataReg;
+      bool zeroW = inData.getType().isInteger(0);
+      if (zeroW) {
+        dataReg = inData; // zero-width (none/control) token: no storage needed.
+      } else {
+        auto dataBE = bb.get(inData.getType());
+        dataReg = s.reg(nm + "_data", dataBE,
+                        createZeroDataConst(s, mod.getLoc(), inData.getType()));
+        dataBE.setValue(s.mux(inFired, {dataReg, inData}));
+      }
+      auto outW = s.wrap(dataReg, full);
+      Value outFired = s.bAnd({full, outW.second});
+      // full' = inFired ? 1 : (outFired ? 0 : full)
+      Value drainedOrHeld = s.mux(outFired, {full, s.constant(1, 0)});
+      fullBE.setValue(s.mux(inFired, {drainedOrHeld, s.constant(1, 1)}));
+      return {inReady, outW.first};
+    };
+
+    Value loadAddrOut, storeOut;
+
+    // ---- LOAD arbiter: N load-addr channels -> 1 ld0.addr; 1 ld0.data ->
+    //      demux to N (data,done) sites. Winner held until its data transacts. ----
+    if (N) {
+      Value i0c = s.constant(0, 0);
+      Type idxT = b.getIntegerType(N);
+      Value noWinner = s.constant(N, 0);
+      auto wonBE = bb.get(idxT);
+      Value wonReg = s.reg("ldmem_won", wonBE, noWinner);
+
+      SmallVector<Value> addrDatas, addrValids;
+      SmallVector<Backedge> addrReadys;
+      for (unsigned k = 0; k < N; ++k) {
+        auto rdy = bb.get(i1Ty);
+        auto uw = s.unwrap(extmemInstance.getOperand(1 + 2 * M + k), rdy);
+        addrDatas.push_back(uw.first);
+        addrValids.push_back(uw.second);
+        addrReadys.push_back(rdy);
+      }
+      DenseMap<size_t, Value> idxMap;
+      Value grant = buildExtMemPriorityArbiter(s, addrValids, noWinner, idxMap);
+      grant = s.mux(s.rOr(wonReg), {grant, wonReg}); // hold winner across latency
+      Value hasWinner = s.rOr(grant);
+      Value winAddr = ohMux1(grant, addrDatas);
+
+      auto retRdy = bb.get(i1Ty);
+      auto retUw = s.unwrap(ldDataArg, retRdy);
+      Value retData = retUw.first, retValid = retUw.second;
+
+      SmallVector<Value> siteConsumed;
+      for (unsigned k = 0; k < N; ++k) {
+        Value vk = s.bAnd({s.bit(grant, k), retValid});
+        // Capture the returned data + done for site k into opaque skids so the
+        // arbiter advances on CAPTURE (skid empty), not downstream consumption.
+        auto dataSkid = makeOpaqueSkid(retData, vk, "ldskidd" + std::to_string(k));
+        auto doneSkid = makeOpaqueSkid(i0c, vk, "ldskidn" + std::to_string(k));
+        extmemInstance.getResult(k).replaceAllUsesWith(dataSkid.second);
+        extmemInstance.getResult(N + M + k).replaceAllUsesWith(doneSkid.second);
+        // The winning site "consumes" the return when BOTH its skids are empty
+        // and can capture (both opaque -> ready == !full, independent of the
+        // downstream loop). One-outstanding: the winner is held until this fires.
+        siteConsumed.push_back(s.bAnd({dataSkid.first, doneSkid.first}));
+      }
+      retRdy.setValue(ohMux1(grant, siteConsumed));
+      Value fired = s.bAnd({retValid, ohMux1(grant, siteConsumed)});
+      wonBE.setValue(s.mux(fired, {grant, noWinner}));
+      Value winnerOrDefault = s.mux(fired, {noWinner, grant});
+      for (unsigned k = 0; k < N; ++k)
+        addrReadys[k].setValue(s.cmp(winnerOrDefault, idxMap[k], eqp));
+
+      loadAddrOut = s.wrap(winAddr, hasWinner).first;
+    }
+
+    // ---- STORE arbiter: M store {addr,data} channels -> 1 st0 struct; 1
+    //      st0.done -> demux to M done sites. ----
+    if (M) {
+      Type idxT = b.getIntegerType(M);
+      Value noWinner = s.constant(M, 0);
+      auto wonBE = bb.get(idxT);
+      Value wonReg = s.reg("stmem_won", wonBE, noWinner);
+
+      SmallVector<Value> aDatas, dDatas, reqValids;
+      SmallVector<Backedge> aReadys, dReadys;
+      for (unsigned k = 0; k < M; ++k) {
+        auto dRdy = bb.get(i1Ty);
+        auto aRdy = bb.get(i1Ty);
+        auto dUw = s.unwrap(extmemInstance.getOperand(1 + 2 * k), dRdy);
+        auto aUw = s.unwrap(extmemInstance.getOperand(1 + 2 * k + 1), aRdy);
+        dDatas.push_back(dUw.first);
+        aDatas.push_back(aUw.first);
+        dReadys.push_back(dRdy);
+        aReadys.push_back(aRdy);
+        reqValids.push_back(s.bAnd({dUw.second, aUw.second}));
+      }
+      DenseMap<size_t, Value> idxMap;
+      Value grant = buildExtMemPriorityArbiter(s, reqValids, noWinner, idxMap);
+      grant = s.mux(s.rOr(wonReg), {grant, wonReg});
+      Value hasWinner = s.rOr(grant);
+      Value winStruct =
+          s.pack({ohMux1(grant, aDatas), ohMux1(grant, dDatas)}, stStructTy);
+
+      auto retRdy = bb.get(i1Ty);
+      auto retUw = s.unwrap(stDoneArg, retRdy);
+      Value retDone = retUw.first, retValid = retUw.second;
+
+      SmallVector<Value> siteConsumed;
+      for (unsigned k = 0; k < M; ++k) {
+        Value vk = s.bAnd({s.bit(grant, k), retValid});
+        auto doneW = s.wrap(retDone, vk);
+        extmemInstance.getResult(N + k).replaceAllUsesWith(doneW.first);
+        siteConsumed.push_back(doneW.second);
+      }
+      retRdy.setValue(ohMux1(grant, siteConsumed));
+      Value fired = s.bAnd({retValid, ohMux1(grant, siteConsumed)});
+      wonBE.setValue(s.mux(fired, {grant, noWinner}));
+      Value winnerOrDefault = s.mux(fired, {noWinner, grant});
+      for (unsigned k = 0; k < M; ++k) {
+        Value rk = s.cmp(winnerOrDefault, idxMap[k], eqp);
+        dReadys[k].setValue(rk);
+        aReadys[k].setValue(rk);
+      }
+      storeOut = s.wrap(winStruct, hasWinner).first;
+    }
+
+    // Append the consolidated OUTPUT ports.
+    SmallVector<std::pair<StringAttr, Value>> newOutputs;
+    if (N)
+      newOutputs.push_back({b.getStringAttr(memName + "_ld0.addr"), loadAddrOut});
+    if (M)
+      newOutputs.push_back({b.getStringAttr(memName + "_st0"), storeOut});
+    mod.appendOutputs(newOutputs);
+
+    // Tear down the extmem instance + extern module + memref arg. modifyPorts
+    // drops the memref from the module TYPE; erase its block argument too (it is
+    // now unused since the instance is gone) to keep type and body in sync.
+    extmemMod.erase();
+    extmemInstance.erase();
+    mod.modifyPorts({}, {}, {memrefArgIdx}, {});
+    mod.getBodyBlock()->eraseArgument(memrefArgIdx);
+  }
+
+  return success();
 }
 
 static void
@@ -1989,6 +2203,12 @@ static LogicalResult convertFuncOp(ESITypeConverter &typeConverter,
       SourceConversionPattern, SinkConversionPattern, ConstantConversionPattern,
       MergeConversionPattern, ControlMergeConversionPattern,
       LoadConversionPattern, StoreConversionPattern, MemoryConversionPattern,
+      // External memory: lower handshake.extmemory to an extern-module instance
+      // in stage 1; convertExtMemoryOps (stage 2) then arbitrates its per-site
+      // ports onto one consolidated boundary port. (Upstream 5d5125753 removed
+      // this registration when it moved extmem lowering to a separate handshake
+      // pass; VTR-HLS re-registers it to arbitrate at the HW level instead.)
+      ExtModuleConversionPattern<handshake::ExternalMemoryOp>,
       InstanceConversionPattern,
       // Arith operations.
       ExtendConversionPattern<arith::ExtUIOp, /*signExtend=*/false>,
