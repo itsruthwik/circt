@@ -289,16 +289,6 @@ static ModulePortInfo getPortInfoForOp(Operation *op) {
   return getPortInfoForOpTypes(op, op->getOperandTypes(), op->getResultTypes());
 }
 
-static llvm::SmallVector<hw::detail::FieldInfo>
-portToFieldInfo(llvm::ArrayRef<hw::PortInfo> portInfo) {
-  llvm::SmallVector<hw::detail::FieldInfo> fieldInfo;
-  for (auto port : portInfo)
-    fieldInfo.push_back({port.name, port.type});
-
-  return fieldInfo;
-}
-
-
 namespace {
 
 // Input handshakes contain a resolved valid and (optional )data signal, and
@@ -839,8 +829,9 @@ static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
         // downstream loop). One-outstanding: the winner is held until this fires.
         siteConsumed.push_back(s.bAnd({dataSkid.first, doneSkid.first}));
       }
-      retRdy.setValue(ohMux1(grant, siteConsumed));
-      Value fired = s.bAnd({retValid, ohMux1(grant, siteConsumed)});
+      Value consumed = ohMux1(grant, siteConsumed);
+      retRdy.setValue(consumed);
+      Value fired = s.bAnd({retValid, consumed});
       wonBE.setValue(s.mux(fired, {grant, noWinner}));
       Value winnerOrDefault = s.mux(fired, {noWinner, grant});
       for (unsigned k = 0; k < N; ++k)
@@ -888,8 +879,9 @@ static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
         extmemInstance.getResult(N + k).replaceAllUsesWith(doneW.first);
         siteConsumed.push_back(doneW.second);
       }
-      retRdy.setValue(ohMux1(grant, siteConsumed));
-      Value fired = s.bAnd({retValid, ohMux1(grant, siteConsumed)});
+      Value consumed = ohMux1(grant, siteConsumed);
+      retRdy.setValue(consumed);
+      Value fired = s.bAnd({retValid, consumed});
       wonBE.setValue(s.mux(fired, {grant, noWinner}));
       Value winnerOrDefault = s.mux(fired, {noWinner, grant});
       for (unsigned k = 0; k < M; ++k) {
