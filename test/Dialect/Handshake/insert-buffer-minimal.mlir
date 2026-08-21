@@ -51,3 +51,31 @@ handshake.func @cyclicMerge(%ctrl: none, ...) -> i32 {
   sink %trueResult : i32
   return %falseResult : i32
 }
+
+// A dataflow cycle can also close through operations that are not merge-like --
+// the loop back-edges a lowered do-while leaves on the control network run
+// through `cond_br`/`join`, with no merge on them. `bufferCyclesStrategy` only
+// buffers merge-like outputs, so those cycles used to escape entirely and become
+// combinational loops that ABC rejects. The `minimal` strategy now covers every
+// cycle: any that is still unbuffered after the merge/argument/memory placement
+// gets one sequential buffer on a back-edge.
+
+// CHECK-LABEL: handshake.func @controlCycleThroughJoin(
+handshake.func @controlCycleThroughJoin(%ctrl: none, %cond: i1, ...) -> none {
+  // The cycle is cond_br -> join -> cond_br, with no merge-like op on it. Before
+  // the cycle-cover fix it carried no buffer; now it must carry a seq buffer.
+  // CHECK: buffer [1] seq
+  %j = join %trueResult, %ctrl : none, none
+  %trueResult, %falseResult = cond_br %cond, %j : none
+  return %falseResult : none
+}
+
+// CHECK-LABEL: handshake.func @controlSelfLoop(
+handshake.func @controlSelfLoop(%ctrl: none, %cond: i1, ...) -> none {
+  // A one-op cycle: cond_br's true result is its own data operand (the tightest
+  // back-edge, as seen in the `fixed`/`sparse` witnesses). It is not merge-like,
+  // so the cycle-cover must place a seq buffer to break it.
+  // CHECK: buffer [1] seq
+  %trueResult, %falseResult = cond_br %cond, %trueResult : none
+  return %falseResult : none
+}

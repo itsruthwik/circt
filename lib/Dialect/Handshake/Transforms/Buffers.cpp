@@ -13,11 +13,14 @@
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/Handshake/HandshakeUtils.h"
+#include "circt/Support/SparseOpSCC.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseSet.h"
 
 namespace circt {
 namespace handshake {
@@ -232,6 +235,10 @@ static void collectMemoryResponses(Operation *op,
       responses.push_back(res);
 }
 
+// Defined below: places the minimum buffers needed so no dataflow cycle is left
+// combinational (a general cycle-cover over the SCC graph).
+static void ensureCycleCover(Region &r, OpBuilder &builder, unsigned numSlots);
+
 // Buffer merge-like outputs, which is where dataflow cycles close, plus every
 // memory response channel.
 //
@@ -279,6 +286,154 @@ static void bufferMinimalStrategy(Region &r, OpBuilder &builder,
       continue;
     insertBuffer(res.getLoc(), res, builder, numSlots, BufferTypeEnum::fifo);
   }
+
+  // `bufferCyclesStrategy` above only buffers merge-like outputs; a cycle that
+  // closes through `cond_br`/`join`/a self-loop escapes it. Place the minimum
+  // buffers so no dataflow cycle is left combinational.
+  ensureCycleCover(r, builder, numSlots);
+}
+
+// True if `op` is a buffer that registers its channel, i.e. breaks any
+// combinational cycle it sits on. HandshakeToHW lowers both `seq` and `fifo`
+// buffers as sequential logic today (see BufferConversionPattern), so either
+// kind, with at least one slot, breaks a combinational loop.
+static bool isRegisteredBuffer(Operation *op) {
+  auto bufferOp = dyn_cast<handshake::BufferOp>(op);
+  return bufferOp && bufferOp.getNumSlots() > 0;
+}
+
+// The def-use edge model shared with RecurrenceReport, extended with a buffer
+// cut. An edge runs from an op to each user of its results, confined to `body`,
+// with two kinds of edge removed:
+//
+//  - The response half of a memory request/response pair. A load feeds a memory
+//    an address and reads data back; that closes a def-use cycle but carries no
+//    token around a loop, so treating it as a recurrence would flag every memory
+//    access as an uncovered combinational cycle. Control/completion results are
+//    `none`-typed and kept, because ordering through them is a genuine
+//    dependence.
+//  - Every edge out of a registered buffer. A buffer breaks the combinational
+//    path through it, so cutting its out-edges makes any remaining cyclic SCC a
+//    *genuinely unbuffered* cycle -- the precise structural condition ABC
+//    rejects. This is what lets a single buffer on one edge cover a cycle: once
+//    placed, that edge is cut and the cycle is no longer an SCC.
+//
+// `operand` is the edge's destination operand (its owner is the user op, which
+// for forward traversal is `op`); the edge's source is its defining op.
+static bool isDataflowCycleEdge(Region &body, Operation *op,
+                                OpOperand &operand) {
+  if (op->getParentRegion() != &body)
+    return false;
+  Operation *defOp = operand.get().getDefiningOp();
+  if (isa_and_nonnull<handshake::MemoryOp, handshake::ExternalMemoryOp>(defOp))
+    return isa<NoneType>(operand.get().getType());
+  if (isa_and_nonnull<handshake::BufferOp>(defOp) && isRegisteredBuffer(defOp))
+    return false;
+  return true;
+}
+
+// Recompute the cyclic SCCs of `r` under the buffer-cutting edge model. Each
+// cyclic SCC returned is a set of ops mutually reachable *without* passing
+// through a registered buffer, i.e. a combinational loop that must be broken.
+static SmallVector<SmallVector<Operation *>> uncoveredCycles(Region &r) {
+  auto edgeFilter = [&r](Operation *op, OpOperand &operand) {
+    return isDataflowCycleEdge(r, op, operand);
+  };
+  SparseOpSCC<OpSCCDirection::Forward> sccs(edgeFilter);
+  for (Block &block : r)
+    for (Operation &op : block)
+      sccs.visit(&op);
+
+  SmallVector<SmallVector<Operation *>> result;
+  for (OpSCC entry : sccs.topological())
+    if (auto cyclic = dyn_cast<CyclicOpSCC>(entry))
+      result.emplace_back(cyclic.begin(), cyclic.end());
+  return result;
+}
+
+// Place the minimum buffers needed so that no dataflow cycle is left without a
+// registered buffer -- a general cycle-cover derived from the SCC graph, not a
+// per-op rule. `bufferCyclesStrategy` only buffers merge-like outputs, so a
+// cycle that closes through `cond_br`/`join`/a self-loop (loop back-edges lowered
+// without a merge) escapes it and becomes a combinational loop. This closes that
+// gap for every such cycle.
+//
+// Cover strategy: while an uncovered cyclic SCC remains, place one sequential
+// buffer on a single intra-SCC edge, which cuts that edge from the graph, then
+// recompute. One buffer per otherwise-uncovered back-edge is the minimal cover
+// (an exact minimum feedback arc set is NP-hard; this greedy iteration places at
+// most one buffer per remaining SCC per round and terminates when the graph is
+// acyclic under the buffer cut).
+static void ensureCycleCover(Region &r, OpBuilder &builder, unsigned numSlots) {
+  // Each round breaks at least one cycle, so the loop is bounded by the number
+  // of cycles; guard against an unexpected non-terminating case regardless.
+  unsigned guard = 0;
+  DenseSet<Operation *> members;
+  while (true) {
+    SmallVector<SmallVector<Operation *>> cycles = uncoveredCycles(r);
+    if (cycles.empty())
+      break;
+    if (++guard > 100000)
+      break;
+
+    for (ArrayRef<Operation *> cycle : cycles) {
+      members.clear();
+      members.insert(cycle.begin(), cycle.end());
+      // Break the cycle by buffering the first intra-SCC channel we find: a
+      // result of a member op that another member consumes and that the edge
+      // model actually traverses (so we do not buffer the cut memory-response
+      // half and leave the real cycle intact).
+      bool placed = false;
+      for (Operation *op : cycle) {
+        for (Value res : op->getResults()) {
+          bool intra = llvm::any_of(res.getUses(), [&](OpOperand &use) {
+            return members.contains(use.getOwner()) &&
+                   isDataflowCycleEdge(r, use.getOwner(), use);
+          });
+          if (!intra)
+            continue;
+          insertBuffer(res.getLoc(), res, builder, numSlots,
+                       BufferTypeEnum::seq);
+          placed = true;
+          break;
+        }
+        if (placed)
+          break;
+      }
+      // A cyclic SCC always has an intra-component traversable edge, so this is
+      // unreachable; recomputing next round would spin without it.
+      assert(placed && "uncovered cycle had no bufferable intra-SCC edge");
+      (void)placed;
+    }
+  }
+}
+
+// Post-placement guarantee: no dataflow cycle may be left combinational. If one
+// survives, emit an error naming its ops -- so an under-placement fails loudly
+// here instead of surfacing downstream as an ABC combinational-loop rejection.
+static LogicalResult verifyCycleCover(Region &r) {
+  SmallVector<SmallVector<Operation *>> cycles = uncoveredCycles(r);
+  if (cycles.empty())
+    return success();
+
+  AsmState state(r.getParentOp());
+  for (ArrayRef<Operation *> cycle : cycles) {
+    InFlightDiagnostic diag =
+        r.getParentOp()->emitError()
+        << "buffer placement left a combinational loop: a dataflow cycle of "
+        << cycle.size() << " op(s) carries no registered buffer";
+    for (Operation *op : cycle) {
+      std::string name = op->getName().getStringRef().str();
+      if (op->getNumResults() > 0) {
+        std::string ssa;
+        llvm::raw_string_ostream os(ssa);
+        op->getResult(0).printAsOperand(os, state);
+        name = os.str() + " = " + name;
+      }
+      diag.attachNote(op->getLoc()) << "on cycle: " << name;
+    }
+  }
+  return failure();
 }
 
 static LogicalResult bufferRegion(Region &r, OpBuilder &builder,
@@ -289,9 +444,15 @@ static LogicalResult bufferRegion(Region &r, OpBuilder &builder,
     bufferAllStrategy(r, builder, bufferSize);
   else if (strategy == "allFIFO")
     bufferAllFIFOStrategy(r, builder, bufferSize);
-  else if (strategy == "minimal")
+  else if (strategy == "minimal") {
     bufferMinimalStrategy(r, builder, bufferSize);
-  else
+    // The minimal strategy is the only one that can leave a cycle uncovered:
+    // `all`/`allFIFO` buffer every channel, and `cycles` is not a shipping
+    // production strategy. Verify the cycle-cover invariant so an under-placed
+    // cycle fails loudly here instead of surfacing downstream as an ABC
+    // combinational-loop rejection.
+    return verifyCycleCover(r);
+  } else
     return r.getParentOp()->emitOpError()
            << "Unknown buffer strategy: " << strategy;
 
